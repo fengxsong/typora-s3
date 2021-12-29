@@ -8,6 +8,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash"
+	"image"
+	"image/jpeg"
+	"image/png"
+	"io"
 	"os"
 	"os/user"
 	"path"
@@ -19,6 +23,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/policy"
+	"github.com/nfnt/resize"
 	"github.com/spf13/pflag"
 	"github.com/stoewer/go-strcase"
 	"gopkg.in/yaml.v2"
@@ -39,6 +44,7 @@ type Config struct {
 	BucketName  string `yaml:"bucketName"`
 	UseSSL      bool   `yaml:"useSsl"`
 	RemoveAfter bool   `yaml:"removeAfter"`
+	ResizeRatio int    `yaml:"resizeRatio"`
 }
 
 func (c *Config) AddFlags(fs *pflag.FlagSet) {
@@ -60,6 +66,7 @@ func (c *Config) AddFlags(fs *pflag.FlagSet) {
 	c.fs.StringVar(&c.SecretKey, "secretKey", "", "SecretKey")
 	c.fs.StringVarP(&c.BucketName, "bucketName", "b", username, "S3 bucket name")
 	c.fs.BoolVar(&c.UseSSL, "useSsl", false, "Perform ssl connection")
+	c.fs.IntVar(&c.ResizeRatio, "resizeRatio", 100, "Resize ratio of images, only support jpg, jpeg, png format")
 }
 
 func copyValue(src, dest *Config) {
@@ -214,6 +221,7 @@ func main() {
 	fs := pflag.NewFlagSet(app, pflag.ExitOnError)
 	cfg := &Config{}
 	cfg.AddFlags(fs)
+	dryRun := fs.Bool("dryrun", false, "DRYRUN mode, only for testing resize images")
 	fs.Parse(os.Args[1:])
 	if fs.NArg() == 0 {
 		return
@@ -237,9 +245,17 @@ func main() {
 
 	assets := make([]*minio.UploadInfo, 0, len(fs.Args()))
 	for i := range fs.Args() {
+		fn, err := resizeImageFile(fs.Arg(i), cfg.ResizeRatio)
+		if err != nil {
+			fatal(err)
+		}
+		if *dryRun {
+			fmt.Println(fn)
+			continue
+		}
 		twCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		info, err := clnt.Upload(twCtx, fs.Arg(i))
+		info, err := clnt.Upload(twCtx, fn)
 		if err != nil {
 			fatal(err)
 		}
@@ -248,6 +264,48 @@ func main() {
 	for _, as := range assets {
 		fmt.Println(toURL(clnt.mc.EndpointURL().String(), as))
 	}
+}
+
+func resizeImageFile(fn string, ratio int) (string, error) {
+	fp, err := os.Open(fn)
+	if err != nil {
+		return "", err
+	}
+	defer fp.Close()
+	ext := strings.TrimPrefix(filepath.Ext(fn), ".")
+	var (
+		dec func(io.Reader) (image.Image, error)
+		enc func(io.Writer, image.Image) error
+	)
+	switch ext {
+	case "jpg", "jpeg":
+		dec = jpeg.Decode
+		enc = func(w io.Writer, m image.Image) error {
+			return jpeg.Encode(w, m, nil)
+		}
+	case "png":
+		dec = png.Decode
+		enc = png.Encode
+	default:
+		return fn, nil
+	}
+	img, err := dec(fp)
+	if err != nil {
+		return "", err
+	}
+	p := img.Bounds().Size()
+	width := p.X * ratio / 100
+	m := resize.Resize(uint(width), 0, img, resize.Lanczos3)
+	dest := fmt.Sprintf("%s_x%d.%s", strings.TrimSuffix(fn, ext), ratio, ext)
+	out, err := os.Create(dest)
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+	if err = enc(out, m); err != nil {
+		return "", err
+	}
+	return dest, nil
 }
 
 func fatal(err error) {
