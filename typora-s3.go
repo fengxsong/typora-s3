@@ -267,6 +267,12 @@ func main() {
 }
 
 func resizeImageFile(fn string, ratio int) (string, error) {
+	if ratio == 0 {
+		return "", fmt.Errorf("invalid ratio setting %d", ratio)
+	}
+	if ratio == 100 {
+		return fn, nil
+	}
 	fp, err := os.Open(fn)
 	if err != nil {
 		return "", err
